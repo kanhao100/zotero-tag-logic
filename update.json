@@ -1,0 +1,17 @@
+{
+  "addons": {
+    "zotero-tag-logic@kanhao100": {
+      "updates": [
+        {
+          "version": "0.1.0",
+          "update_link": "https://github.com/kanhao100/zotero-tag-logic/releases/download/v0.1.0/zotero-tag-logic-0.1.0.xpi",
+          "applications": {
+            "zotero": {
+              "strict_min_version": "8.0"
+            }
+          }
+        }
+      ]
+    }
+  }
+}
