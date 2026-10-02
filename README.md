@@ -3,6 +3,8 @@
 Adds an **AND / OR** toggle next to the Tag Selector's filter box (also available as a checkbox in the
 Tag Selector's settings menu: *Match Any Selected Tag (OR)*).
 
+![AND / OR toggle next to the Tag Selector filter box](docs/toggle.png)
+
 - **AND** (default): native Zotero behavior.
 - **OR**: selecting several tags shows items that have *any* of them. The tag list keeps showing every
   tag in the current scope, so you can keep adding tags.
