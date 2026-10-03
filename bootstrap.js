@@ -1,16 +1,25 @@
 /* Zotero Tag Logic
  *
- * Adds an AND / OR toggle to the Tag Selector.
+ * Tag Selector filtering with per-tag roles:
+ *
+ *   MUST  the item must have this tag                    (plain click in AND mode)
+ *   ANY   the item must have at least one of the ANY tags (plain click in OR mode)
+ *   NOT   the item must have none of the NOT tags         (Alt+click)
+ *
+ * Ctrl+click sets the role that a plain click does not (ANY in AND mode, MUST in OR mode).
+ * Result = (ANY1 OR ANY2 ...) AND MUST1 AND MUST2 ... AND NOT NOT1 AND NOT NOT2 ...
  *
  * How it works (Zotero 8+): CollectionTreeRow builds the items-pane search from
  * "collection scope + quick search + selected tags", with every selected tag ANDed.
- * In OR mode we build the same search *without* tags (the "base" search), then wrap it
- * in a second, unsaved Zotero.Search scoped to the base results whose only condition is
- * a group  ( tag A OR tag B OR ... ). Nothing is written to the database.
+ * When the selection needs more than that, we build the same search *without* tags (the
+ * "base" search), then wrap it in a second, unsaved Zotero.Search scoped to the base
+ * results whose conditions are  tag-is (MUST), tag-isNot (NOT) and one condition group
+ * (tag A OR tag B ...) for ANY. Nothing is written to the database.
  *
- * The Tag Selector lists only tags found in the current results, so with the OR filter
- * applied the other tags would vanish. In OR mode we therefore feed the tag list from
- * the base results instead.
+ * The Tag Selector lists only tags found in the current results, so the ANY and NOT tags
+ * would vanish from it. While those roles are in use, the tag list is fed from the base
+ * results narrowed by MUST and NOT only (ANY ignored), and the selected tags are always
+ * kept in the list so they can be deselected.
  */
 
 var TagLogic;
@@ -21,16 +30,22 @@ const STRINGS = {
 	en: {
 		and: 'AND',
 		or: 'OR',
-		titleAnd: 'Tag match: AND — items must have all selected tags.\nClick to switch to OR.',
-		titleOr: 'Tag match: OR — items with any selected tag.\nClick to switch to AND.',
-		menuOr: 'Match Any Selected Tag (OR)'
+		modeAnd: 'Tag match: AND — a plain click means "must have".',
+		modeOr: 'Tag match: OR — a plain click means "any of".',
+		hintAnd: 'Ctrl+click: any of  ·  Alt+click: NOT  ·  Click the toggle to switch.',
+		hintOr: 'Ctrl+click: must have  ·  Alt+click: NOT  ·  Click the toggle to switch.',
+		menuOr: 'Match Any Selected Tag (OR)',
+		not: 'NOT'
 	},
 	zh: {
 		and: 'AND',
 		or: 'OR',
-		titleAnd: '标签匹配：AND — 条目须同时具有所有已选标签。\n点击切换为 OR。',
-		titleOr: '标签匹配：OR — 条目具有任一已选标签即可。\n点击切换为 AND。',
-		menuOr: '匹配任一已选标签（OR）'
+		modeAnd: '标签匹配：AND — 普通点击表示“必须有”。',
+		modeOr: '标签匹配：OR — 普通点击表示“任一”。',
+		hintAnd: 'Ctrl+点击：任一  ·  Alt+点击：排除 (NOT)  ·  点击开关切换模式',
+		hintOr: 'Ctrl+点击：必须有  ·  Alt+点击：排除 (NOT)  ·  点击开关切换模式',
+		menuOr: '匹配任一已选标签（OR）',
+		not: 'NOT'
 	}
 };
 
@@ -61,6 +76,23 @@ const STYLE = `
 .tag-logic-toggle > span[data-active="true"] {
 	background-color: var(--accent-blue);
 	color: var(--accent-white);
+}
+
+/* ANY: outlined, with a union marker */
+.tag-selector-item.selected[data-tl-role="any"] {
+	background-color: transparent !important;
+	color: var(--accent-blue) !important;
+	box-shadow: inset 0 0 0 1px var(--accent-blue);
+}
+.tag-selector-item.selected[data-tl-role="any"]::after {
+	content: " \\222a";
+	opacity: 0.7;
+}
+/* NOT: red, struck through */
+.tag-selector-item.selected[data-tl-role="not"] {
+	background-color: var(--accent-red) !important;
+	color: var(--accent-white) !important;
+	text-decoration: line-through;
 }
 `;
 
@@ -112,18 +144,63 @@ class TagLogicPlugin {
 	}
 
 	// ----------------------------------------------------------------------
-	// Search patches
+	// Roles
 	// ----------------------------------------------------------------------
 
-	/** OR group in the items search: only when 2+ tags are selected */
-	orSearchActive(row) {
-		return !this.destroyed && this.mode === 'or' && row.tags?.size >= 2;
+	/** Role of a selected tag: an explicit one if set, otherwise the mode's default */
+	roleOf(row, tag) {
+		return row._tlRoles?.get(tag) ?? (this.mode === 'or' ? 'any' : 'must');
 	}
 
-	/** Tag list scope ignoring the tag filter: whenever any tag is selected */
-	orScopeActive(row) {
-		return !this.destroyed && this.mode === 'or' && row.tags?.size >= 1;
+	/** Split the row's selected tags by role */
+	partition(row) {
+		let parts = { must: [], any: [], not: [] };
+		for (let tag of row.tags || []) {
+			parts[this.roleOf(row, tag)].push(tag);
+		}
+		return parts;
 	}
+
+	/** Native Zotero already gives the right result when there is no NOT and at most one ANY */
+	isNative(parts) {
+		return parts.not.length === 0 && parts.any.length <= 1;
+	}
+
+	/** Whether the items search needs our wrapper */
+	filterActive(row) {
+		return !this.destroyed && row.tags?.size > 0 && !this.isNative(this.partition(row));
+	}
+
+	/** Whether the tag list must be fed from the tag-unfiltered scope */
+	scopeActive(row) {
+		if (this.destroyed || !(row.tags?.size > 0)) {
+			return false;
+		}
+		let parts = this.partition(row);
+		return parts.any.length >= 1 || parts.not.length >= 1;
+	}
+
+	/** Human-readable form of the current filter, e.g. (A OR B) AND C AND NOT D */
+	describe(row) {
+		if (!row || !(row.tags?.size > 0)) {
+			return '';
+		}
+		let { must, any, not } = this.partition(row);
+		let out = [];
+		if (any.length) {
+			out.push(any.length > 1 ? `(${any.join(' OR ')})` : any[0]);
+		}
+		out.push(...must);
+		let text = out.join(' AND ');
+		for (let tag of not) {
+			text += (text ? ' AND ' : '') + `${this.str.not} ${tag}`;
+		}
+		return text;
+	}
+
+	// ----------------------------------------------------------------------
+	// Search patches
+	// ----------------------------------------------------------------------
 
 	init() {
 		let plugin = this;
@@ -132,22 +209,22 @@ class TagLogicPlugin {
 		this.orig.getSearchObject = proto.getSearchObject;
 
 		this.patch(proto, 'getSearchObject', (orig) => async function (options = {}) {
-			if (options.unfiltered || !plugin.orSearchActive(this)) {
+			if (options.unfiltered || !plugin.filterActive(this)) {
 				return orig.call(this, options);
 			}
-			if (!this._tlOrSearchP) {
-				// Read the tags now, before any await
-				let tags = [...this.tags];
-				this._tlOrSearchP = plugin.buildOrSearch(this, tags).catch((e) => {
-					this._tlOrSearchP = null;
+			if (!this._tlFilterP) {
+				// Read the roles now, before any await
+				let parts = plugin.partition(this);
+				this._tlFilterP = plugin.buildFilter(this, parts, true).catch((e) => {
+					this._tlFilterP = null;
 					throw e;
 				});
 			}
-			return this._tlOrSearchP;
+			return this._tlFilterP;
 		});
 
 		this.patch(proto, 'getTags', (orig) => async function (types, tagIDs) {
-			if (!plugin.orScopeActive(this)) {
+			if (!plugin.scopeActive(this)) {
 				return orig.call(this, types, tagIDs);
 			}
 			switch (this.type) {
@@ -156,36 +233,48 @@ class TagLogicPlugin {
 				case 'feeds':
 					return [];
 			}
-			let ids = await plugin.getBaseResults(this);
-			let tmpTable = await Zotero.Search.idsToTempTable(ids);
-			try {
-				return await Zotero.Tags.getAllWithin({ tmpTable, types, tagIDs });
+			let ids = await plugin.getScopeResults(this);
+			let tags = await plugin.tagsForIDs(ids, types, tagIDs);
+			if (!types && !tagIDs) {
+				plugin.addSelectedTags(tags, this);
 			}
-			finally {
-				await Zotero.DB.queryAsync(`DROP TABLE IF EXISTS ${tmpTable}`, false, { noCache: true });
-			}
+			return tags;
 		});
 
 		this.patch(proto, 'clearCache', (orig) => function () {
 			this._tlBaseP = null;
 			this._tlBaseResultsP = null;
-			this._tlOrSearchP = null;
+			this._tlScopeResultsP = null;
+			this._tlFilterP = null;
 			return orig.apply(this, arguments);
 		});
 
+		// Drop roles of tags that are no longer selected
+		this.patch(proto, 'setTags', (orig) => function (tags) {
+			if (this._tlRoles?.size) {
+				let keep = tags instanceof Set ? tags : new Set(tags || []);
+				for (let tag of [...this._tlRoles.keys()]) {
+					if (!keep.has(tag)) {
+						this._tlRoles.delete(tag);
+					}
+				}
+			}
+			return orig.call(this, tags);
+		});
+
 		this.patch(Zotero.CollectionTreeRow, 'getTagsAcrossRows', (orig) => async function (rows, types, tagIDs) {
-			if (!rows.some((row) => plugin.orScopeActive(row))) {
+			if (!rows.some((row) => plugin.scopeActive(row))) {
 				return orig.call(this, rows, types, tagIDs);
 			}
-			// Same as the original, but rows in OR mode contribute their tag-unfiltered scope
+			// Same as the original, but rows using ANY/NOT contribute their tag-list scope
 			let tagRows = rows.filter((row) => !['share', 'bucket', 'feeds'].includes(row.type));
 			if (!tagRows.length) {
 				return [];
 			}
 			let itemIDs = new Set();
 			let resultSets = await Promise.all(tagRows.map(
-				(row) => plugin.orScopeActive(row)
-					? plugin.getBaseResults(row)
+				(row) => plugin.scopeActive(row)
+					? plugin.getScopeResults(row)
 					: row.getSearchResults(false)
 			));
 			for (let ids of resultSets) {
@@ -193,13 +282,15 @@ class TagLogicPlugin {
 					itemIDs.add(id);
 				}
 			}
-			let tmpTable = await Zotero.Search.idsToTempTable([...itemIDs]);
-			try {
-				return await Zotero.Tags.getAllWithin({ tmpTable, types, tagIDs });
+			let tags = await plugin.tagsForIDs([...itemIDs], types, tagIDs);
+			if (!types && !tagIDs) {
+				for (let row of tagRows) {
+					if (plugin.scopeActive(row)) {
+						plugin.addSelectedTags(tags, row);
+					}
+				}
 			}
-			finally {
-				await Zotero.DB.queryAsync(`DROP TABLE IF EXISTS ${tmpTable}`, false, { noCache: true });
-			}
+			return tags;
 		});
 
 		Zotero.TagLogic = this;
@@ -210,6 +301,27 @@ class TagLogicPlugin {
 		let wrapper = factory(orig);
 		obj[name] = wrapper;
 		this.patches.push({ obj, name, orig, wrapper });
+	}
+
+	async tagsForIDs(ids, types, tagIDs) {
+		let tmpTable = await Zotero.Search.idsToTempTable(ids);
+		try {
+			return await Zotero.Tags.getAllWithin({ tmpTable, types, tagIDs });
+		}
+		finally {
+			await Zotero.DB.queryAsync(`DROP TABLE IF EXISTS ${tmpTable}`, false, { noCache: true });
+		}
+	}
+
+	/** Selected tags must stay in the list even if the scope excludes them (NOT, ANY) */
+	addSelectedTags(tags, row) {
+		let present = new Set(tags.map((t) => t.tag));
+		for (let tag of row.tags) {
+			if (!present.has(tag)) {
+				tags.push({ tag, type: 0 });
+				present.add(tag);
+			}
+		}
 	}
 
 	/**
@@ -245,26 +357,49 @@ class TagLogicPlugin {
 		return row._tlBaseP;
 	}
 
+	async runSearch(search) {
+		try {
+			return await search.search();
+		}
+		catch (e) {
+			Zotero.logError(e);
+			throw new Zotero.CollectionTreeRow.SearchError(e);
+		}
+	}
+
 	getBaseResults(row) {
 		if (!row._tlBaseResultsP) {
-			row._tlBaseResultsP = (async () => {
-				let search = await this.getBase(row);
-				try {
-					return await search.search();
-				}
-				catch (e) {
-					Zotero.logError(e);
-					throw new Zotero.CollectionTreeRow.SearchError(e);
-				}
-			})().catch((e) => {
-				row._tlBaseResultsP = null;
-				throw e;
-			});
+			row._tlBaseResultsP = (async () => this.runSearch(await this.getBase(row)))()
+				.catch((e) => {
+					row._tlBaseResultsP = null;
+					throw e;
+				});
 		}
 		return row._tlBaseResultsP;
 	}
 
-	async buildOrSearch(row, tags) {
+	/** Item IDs the tag list is built from: the base results narrowed by MUST and NOT, ignoring ANY */
+	getScopeResults(row) {
+		if (!row._tlScopeResultsP) {
+			let parts = this.partition(row);
+			row._tlScopeResultsP = (async () => {
+				if (!parts.must.length && !parts.not.length) {
+					return this.getBaseResults(row);
+				}
+				return this.runSearch(await this.buildFilter(row, parts, false));
+			})().catch((e) => {
+				row._tlScopeResultsP = null;
+				throw e;
+			});
+		}
+		return row._tlScopeResultsP;
+	}
+
+	/**
+	 * Unsaved search scoped to the row's tag-less base search:
+	 *   MUST tags ANDed, NOT tags excluded and, if withAny, (ANY tags ORed).
+	 */
+	async buildFilter(row, parts, withAny) {
 		let base = await this.getBase(row);
 		let s = new Zotero.Search();
 		// Same library/trash handling as the outer search in CollectionTreeRow
@@ -277,18 +412,26 @@ class TagLogicPlugin {
 		if (row.isTrash()) {
 			s.addCondition('deleted', 'true');
 		}
-		s.addCondition('groupStart', 'true', '');
-		s.addCondition('joinMode', 'any');
-		for (let tag of tags) {
+		for (let tag of parts.must) {
 			s.addCondition('tag', 'is', tag);
 		}
-		s.addCondition('groupEnd', 'true', '');
+		for (let tag of parts.not) {
+			s.addCondition('tag', 'isNot', tag);
+		}
+		if (withAny && parts.any.length) {
+			s.addCondition('groupStart', 'true', '');
+			s.addCondition('joinMode', 'any');
+			for (let tag of parts.any) {
+				s.addCondition('tag', 'is', tag);
+			}
+			s.addCondition('groupEnd', 'true', '');
+		}
 		s.setScope(base, false);
 		return s;
 	}
 
 	// ----------------------------------------------------------------------
-	// Mode switching
+	// Mode and role switching
 	// ----------------------------------------------------------------------
 
 	async setMode(mode) {
@@ -297,14 +440,60 @@ class TagLogicPlugin {
 			return;
 		}
 		Zotero.Prefs.set(PREF_MODE, mode, true);
+		await Promise.all(Zotero.getMainWindows().map((win) => this.refreshView(win)));
 		for (let win of this.windows.keys()) {
 			this.updateUI(win);
 		}
-		await Promise.all(Zotero.getMainWindows().map((win) => this.refreshView(win)));
 	}
 
 	toggleMode() {
 		return this.setMode(this.mode === 'or' ? 'and' : 'or');
+	}
+
+	/**
+	 * Alt+click / Ctrl+click on a tag.
+	 * @param {String} name
+	 * @param {'not'|'other'} modifier - 'other' is the role a plain click does not give
+	 */
+	async setRole(win, name, modifier) {
+		try {
+			let pane = win.ZoteroPane;
+			let tagSelector = pane?.tagSelector;
+			let view = pane?.itemsView;
+			if (!tagSelector || !view) {
+				return;
+			}
+			let rows = view.collectionTreeRows;
+			if (!rows.length) {
+				return;
+			}
+			let wanted = modifier === 'not' ? 'not' : (this.mode === 'or' ? 'must' : 'any');
+			let selected = tagSelector.selectedTags.has(name);
+
+			// Same role again: deselect, like a plain click on a selected tag
+			if (selected && this.roleOf(rows[0], name) === wanted) {
+				tagSelector.handleTagSelected(name);
+				return;
+			}
+
+			for (let row of rows) {
+				if (!row._tlRoles) {
+					row._tlRoles = new Map();
+				}
+				row._tlRoles.set(name, wanted);
+			}
+			if (!selected) {
+				// Selecting runs the normal path: onSelection -> setFilter -> setTags -> refresh
+				tagSelector.handleTagSelected(name);
+				return;
+			}
+			// Role of an already-selected tag changed: the tag set is the same, so setTags()
+			// won't trigger a refresh
+			await this.refreshView(win);
+		}
+		catch (e) {
+			Zotero.logError(e);
+		}
 	}
 
 	/** Re-run the current view's search, but only if tags are selected (otherwise nothing changes) */
@@ -337,7 +526,7 @@ class TagLogicPlugin {
 			return;
 		}
 		let doc = win.document;
-		let state = { observer: null, timer: null };
+		let state = { observer: null, timer: null, container: null, onClick: null };
 		this.windows.set(win, state);
 
 		let style = doc.createElement('style');
@@ -347,10 +536,16 @@ class TagLogicPlugin {
 
 		this.ensureUI(win);
 
-		// The tag selector is a React tree that gets rebuilt when it is hidden and shown
-		// again, so re-attach the toggle whenever it goes missing
 		let container = doc.getElementById('zotero-tag-selector-container');
 		if (container) {
+			// Capture phase, so modified clicks never reach the tag selector's own handler
+			state.container = container;
+			state.onClick = (ev) => this.onTagClick(win, ev);
+			container.addEventListener('click', state.onClick, true);
+
+			// The tag selector is a React tree that gets rebuilt when it is hidden and shown
+			// again, and re-renders tags as the selection changes, so re-attach the toggle
+			// and re-mark the tags whenever the DOM changes
 			state.observer = new win.MutationObserver(() => {
 				if (state.timer) {
 					return;
@@ -360,7 +555,12 @@ class TagLogicPlugin {
 					this.ensureUI(win);
 				}, 50);
 			});
-			state.observer.observe(container, { childList: true, subtree: true });
+			state.observer.observe(container, {
+				childList: true,
+				subtree: true,
+				attributes: true,
+				attributeFilter: ['class']
+			});
 		}
 	}
 
@@ -371,12 +571,31 @@ class TagLogicPlugin {
 		}
 		this.windows.delete(win);
 		state.observer?.disconnect();
+		state.container?.removeEventListener('click', state.onClick, true);
 		if (state.timer) {
 			win.clearTimeout(state.timer);
 		}
 		let doc = win.document;
-		doc.querySelectorAll('.tag-logic-toggle, #tag-logic-menuitem, #tag-logic-style')
+		doc.querySelectorAll('.tag-logic-toggle, #tag-logic-menuitem, #tag-logic-expr, #tag-logic-style')
 			.forEach((el) => el.remove());
+		doc.querySelectorAll('[data-tl-role]').forEach((el) => delete el.dataset.tlRole);
+	}
+
+	onTagClick(win, ev) {
+		if (ev.button !== 0 || this.destroyed) {
+			return;
+		}
+		let modifier = ev.altKey ? 'not' : (ev.ctrlKey || ev.metaKey) ? 'other' : null;
+		if (!modifier) {
+			return;
+		}
+		let item = ev.target.closest?.('.tag-selector-item');
+		if (!item || item.classList.contains('disabled')) {
+			return;
+		}
+		ev.preventDefault();
+		ev.stopPropagation();
+		this.setRole(win, item.textContent, modifier);
 	}
 
 	ensureUI(win) {
@@ -404,9 +623,16 @@ class TagLogicPlugin {
 			filterContainer.insertBefore(btn, filterContainer.querySelector('.tag-selector-actions'));
 		}
 
-		// Checkbox in the tag selector's settings menu (keyboard-accessible alternative)
+		// Items in the tag selector's settings menu: the mode checkbox (keyboard-accessible
+		// alternative to the button) and a read-only line showing the current filter
 		let menu = doc.getElementById('tag-selector-view-settings-menu');
 		if (menu && !doc.getElementById('tag-logic-menuitem')) {
+			let expr = doc.createXULElement('menuitem');
+			expr.id = 'tag-logic-expr';
+			expr.setAttribute('disabled', 'true');
+			expr.hidden = true;
+			menu.insertBefore(expr, doc.getElementById('num-selected')?.nextSibling || null);
+
 			let item = doc.createXULElement('menuitem');
 			item.id = 'tag-logic-menuitem';
 			item.setAttribute('type', 'checkbox');
@@ -422,16 +648,42 @@ class TagLogicPlugin {
 	updateUI(win) {
 		let doc = win.document;
 		let mode = this.mode;
+		let row = win.ZoteroPane?.itemsView?.collectionTreeRows?.[0];
+		let expression = this.describe(row);
+
+		// Mark selected tags that are not plain MUST
+		for (let el of doc.querySelectorAll('#zotero-tag-selector .tag-selector-item')) {
+			let role = row && el.classList.contains('selected') ? this.roleOf(row, el.textContent) : null;
+			if (role && role !== 'must') {
+				el.dataset.tlRole = role;
+			}
+			else {
+				delete el.dataset.tlRole;
+			}
+		}
+
 		let btn = doc.querySelector('.tag-logic-toggle');
 		if (btn) {
 			for (let seg of btn.children) {
 				seg.dataset.active = String(seg.dataset.mode === mode);
 			}
-			btn.title = mode === 'or' ? this.str.titleOr : this.str.titleAnd;
+			let lines = [
+				mode === 'or' ? this.str.modeOr : this.str.modeAnd,
+				mode === 'or' ? this.str.hintOr : this.str.hintAnd
+			];
+			if (expression) {
+				lines.push('', expression);
+			}
+			btn.title = lines.join('\n');
 		}
 		let item = doc.getElementById('tag-logic-menuitem');
 		if (item) {
 			item.setAttribute('checked', String(mode === 'or'));
+		}
+		let exprItem = doc.getElementById('tag-logic-expr');
+		if (exprItem) {
+			exprItem.setAttribute('label', expression);
+			exprItem.hidden = !expression;
 		}
 	}
 
@@ -449,11 +701,12 @@ class TagLogicPlugin {
 			}
 		}
 		this.patches = [];
-		// Drop cached OR searches and restore native results
+		// Drop cached searches and roles, and restore native results
 		for (let win of wins) {
 			let rows = win.ZoteroPane?.itemsView?.collectionTreeRows || [];
 			for (let row of rows) {
-				row._tlBaseP = row._tlBaseResultsP = row._tlOrSearchP = null;
+				row._tlBaseP = row._tlBaseResultsP = row._tlScopeResultsP = row._tlFilterP = null;
+				row._tlRoles = null;
 			}
 			await this.refreshView(win);
 		}
